@@ -4,3 +4,4 @@ faster-whisper
 sounddevice
 numpy
 pyttsx3
+pyautogui
