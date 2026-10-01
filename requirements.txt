@@ -5,3 +5,5 @@ sounddevice
 numpy
 pyttsx3
 pyautogui
+psutil 
+pywin32
