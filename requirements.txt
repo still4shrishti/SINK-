@@ -1,0 +1,7 @@
+PySide6
+openai
+faster-whisper
+sounddevice
+numpy
+pyttsx3
+pyautogui
