@@ -38,9 +38,6 @@ venv\Scripts\activate
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Extra packages used by gui.py
-pip install psutil pywin32
-```
 
 > `psutil` is imported by `gui.py` for CPU / RAM / battery / disk status. `pywin32` provides `pythoncom`, which is used to make text-to-speech work inside threads. Consider adding both to `requirements.txt`.
 
