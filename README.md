@@ -1,6 +1,6 @@
 # SINK – Local Voice AI Desktop Assistant
 
-SINK is a Jarvis-like assistant that runs fully on your own PC. It listens through your microphone, understands speech with **faster-whisper**, chats using a local model served by **LM Studio**, speaks back with **pyttsx3**, and can control your desktop (open apps, scroll, click, type, etc.) with **pyautogui**. The GUI is built with **PySide6** and includes an animated chibi robot.
+SINK is a Jarvis-like assistant that runs fully on your own PC. It listens through your microphone, understands speech with **faster-whisper**, chats using a local model served by **LM Studio ** Qwen 4b, speaks back with **pyttsx3**, and can control your desktop (open apps, scroll, click, type, etc.) with **pyautogui**. The GUI is built with **PySide6** and includes an animated chibi robot.
 
 > **Platform:** Windows (uses `pythoncom`, Windows app launch names such as `msedge`, `calc`, `ms-settings:`).
 
