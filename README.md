@@ -43,7 +43,6 @@ Your voice and notes are not sent to any cloud service. Everything stays on your
 Filler words like *please*, *can you*, *kar do* and *karo* are ignored, and a few Hindi words (*kholo*, *neeche*, *upar*) work too.
 
 ### Smart extras
-- **Rock Paper Scissors:** "SINK play stone paper scissors", then just say rock, paper or scissors. Say "stop game" for the final score.
 - **Tasks and notes:** "add task finish assignment", "read my tasks", "complete task 2"
 - **Reminders and timers:** "remind me in 10 minutes to drink water", "set a timer for 5 minutes"
 - **Dictation mode:** "start typing", then whatever you say is typed into any app. Say "new line" for enter and "stop typing" to finish.
