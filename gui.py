@@ -1,14 +1,5 @@
 import sys
 import socket
-
-# =========================================================
-# SHORTCUT-KEY LAUNCH (single instance, runs BEFORE heavy imports)
-# A Windows desktop shortcut with a "Shortcut key" starts this file.
-#  - SINK not running  -> this process becomes SINK.
-#  - SINK already running -> this process only tells it "toggle"
-#    (wake / sleep) and exits instantly.
-# =========================================================
-
 SINK_PORT = 48765
 _SINK_SERVER = None
 
