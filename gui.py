@@ -1,4 +1,50 @@
 import sys
+import socket
+
+# =========================================================
+# SHORTCUT-KEY LAUNCH (single instance, runs BEFORE heavy imports)
+# A Windows desktop shortcut with a "Shortcut key" starts this file.
+#  - SINK not running  -> this process becomes SINK.
+#  - SINK already running -> this process only tells it "toggle"
+#    (wake / sleep) and exits instantly.
+# =========================================================
+
+SINK_PORT = 48765
+_SINK_SERVER = None
+
+
+def _claim_single_instance():
+
+    global _SINK_SERVER
+
+    msg = b"dashboard" if "--dashboard" in sys.argv else b"toggle"
+
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", SINK_PORT),
+            timeout=0.3,
+        ) as s:
+            s.sendall(msg)
+        return False
+    except OSError:
+        pass
+
+    try:
+        # No SO_REUSEADDR on purpose: on Windows it would allow
+        # two SINK copies to share the same port.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", SINK_PORT))
+        srv.listen(5)
+        _SINK_SERVER = srv
+    except OSError:
+        pass
+
+    return True
+
+
+if __name__ == "__main__" and not _claim_single_instance():
+    sys.exit(0)
+
 import math
 import random
 import re
@@ -24,12 +70,16 @@ from openai import OpenAI
 
 from PySide6.QtCore import (
     Qt,
+    QObject,
     QTimer,
     QPointF,
     QThread,
     Signal,
 )
 from PySide6.QtGui import (
+    QAction,
+    QIcon,
+    QPixmap,
     QColor,
     QPainter,
     QPen,
@@ -37,6 +87,8 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 from PySide6.QtWidgets import (
+    QMenu,
+    QSystemTrayIcon,
     QApplication,
     QWidget,
     QVBoxLayout,
@@ -73,7 +125,8 @@ INITIAL_PROMPT = (
     "double click, right click, hit enter, go to YouTube, "
     "move mouse right 200, press enter, type hello, "
     "click send, what's on my screen, solve what I copied, "
-    "what can I say."
+    "what can I say, learn study mode, run study mode, "
+    "friend mode, assistant mode, call me Sir, call me Mam."
 )
 
 
@@ -156,6 +209,86 @@ def clean_for_speech(text):
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
+
+
+# =========================================================
+# PERSONA  (Mam / Sir  +  Assistant / Friend mode)
+# =========================================================
+
+PERSONA_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "sink_settings.json",
+)
+
+PERSONA_DEFAULT = {"address": "Mam", "mode": "assistant"}
+
+# No command for this many minutes -> SINK goes to sleep
+# (stops the microphone listener and hides the chibi).
+# The shortcut key wakes it again.
+AUTO_SLEEP_MIN = 10
+
+
+def persona_load():
+    try:
+        with open(PERSONA_FILE, "r", encoding="utf-8") as f:
+            return {**PERSONA_DEFAULT, **json.load(f)}
+    except (OSError, ValueError):
+        return dict(PERSONA_DEFAULT)
+
+
+def persona_set(key, value):
+    data = persona_load()
+    data[key] = value
+    try:
+        with open(PERSONA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError as error:
+        print("PERSONA SAVE ERROR:", error)
+
+
+def persona_text():
+    p = persona_load()
+
+    if p["mode"] == "friend":
+        return (
+            "SINK persona: FRIEND MODE. Talk like a warm, caring close "
+            "friend and mentor. This overrides the earlier brevity rule: "
+            "when the user asks for advice, a lesson, or wants to talk "
+            "about feelings, answer in up to 6 short spoken sentences. "
+            "Be honest and kind, not just flattering. Call the user "
+            + p["address"]
+            + " now and then, in a friendly way. Plain spoken text only, "
+            "no markdown or lists."
+        )
+
+    return (
+        "SINK persona: ASSISTANT MODE. Be polite and professional. "
+        "Address the user as "
+        + p["address"]
+        + "."
+    )
+
+
+def persona_command(t):
+    """Return a short spoken reply if t is a persona command, else None."""
+
+    if re.search(r"\b(?:friend) mode\b", t):
+        persona_set("mode", "friend")
+        return "Friend mode on. I'm all ears."
+
+    if re.search(r"\b(?:assistant) mode\b", t):
+        persona_set("mode", "assistant")
+        return "Assistant mode on."
+
+    if re.search(r"\bcall me (?:ma'?am|mam|madam)\b", t):
+        persona_set("address", "Mam")
+        return "Sure, Mam."
+
+    if re.search(r"\bcall me sir\b", t):
+        persona_set("address", "Sir")
+        return "Sure, Sir."
+
+    return None
 
 
 # =========================================================
@@ -2334,6 +2467,208 @@ def needs_focus(text):
 # RUN ONE COMMAND
 # =========================================================
 
+# =========================================================
+# YOUTUBE: search + click the first video
+# "search lofi music on youtube and click first video"
+# =========================================================
+
+YT_FIRST = (
+    r"(?:\s+(?:and|then|and then)\s+(?:click|play|open|select)"
+    r"(?:\s+on)?(?:\s+the)?\s+(?:first|top|1st)\s+"
+    r"(?:video|result|one))?"
+)
+
+
+def click_first_video():
+    # Best effort: finds the first normal video link on a YouTube
+    # page using Windows UI Automation (needs pywinauto).
+    try:
+        import win32gui
+        from pywinauto import Desktop
+    except Exception:
+        return "Click needs pywinauto installed."
+
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        win = Desktop(backend="uia").window(handle=hwnd)
+
+        # Only act on a YouTube window, never on some other site.
+        if "youtube" not in win.window_text().lower():
+            return "I don't see YouTube open."
+
+        links = win.descendants(control_type="Hyperlink")
+
+        print("FIRST VIDEO: hyperlinks seen:", len(links))
+
+        for el in links:
+            try:
+                label = el.window_text().strip().lower()
+
+                if not label or not el.is_visible():
+                    continue
+
+                # A video link's name has views/watching or a length
+                # like "3 hours, 10 minutes".
+                looks_like_video = re.search(
+                    r"\b(?:views?|watching)\b"
+                    r"|\b\d+\s*(?:hours?|minutes?|seconds?)\b",
+                    label,
+                )
+
+                if (
+                    looks_like_video
+                    and not re.search(r"sponsored|\bad\b|shorts?", label)
+                ):
+                    print("FIRST VIDEO: clicking:", label[:90])
+                    el.click_input()
+                    return "Playing the first video."
+
+            except Exception:
+                pass
+
+        return "I couldn't find a video on this page."
+
+    except Exception as error:
+        print("CLICK FIRST VIDEO ERROR:", error)
+        return "I couldn't click the first video."
+
+
+def debug_links():
+    # Prints what Windows can see in the front window (for fixing).
+    try:
+        import win32gui
+        from pywinauto import Desktop
+
+        hwnd = win32gui.GetForegroundWindow()
+        win = Desktop(backend="uia").window(handle=hwnd)
+
+        print("DEBUG window title:", win.window_text())
+
+        links = win.descendants(control_type="Hyperlink")
+
+        print("DEBUG hyperlinks:", len(links))
+
+        shown = 0
+
+        for el in links:
+            label = el.window_text().strip()
+
+            if label:
+                print("DEBUG link:", label[:90])
+                shown += 1
+
+            if shown >= 25:
+                break
+
+        return (
+            f"I can see {len(links)} links. "
+            "I printed the first ones in the console."
+        )
+
+    except Exception as error:
+        print("DEBUG ERROR:", error)
+        return "Debug failed. Check the console."
+
+
+def click_first_video_wait():
+    # The page may still be loading, so try a few times.
+    reply = "I couldn't find a video on this page."
+
+    for _ in range(4):
+        reply = click_first_video()
+
+        if reply.startswith("Playing"):
+            return reply
+
+        time.sleep(2)
+
+    return reply
+
+
+def first_video_url(query):
+    # Finds the first video for a search WITHOUT clicking anything.
+    # Needs:  pip install yt-dlp   (if missing, SINK falls back to
+    # clicking the page).
+    try:
+        import yt_dlp
+    except Exception:
+        return None
+
+    try:
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": True,
+        }
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(
+                "ytsearch1:" + query,
+                download=False,
+            )
+
+        entries = info.get("entries") or []
+
+        if entries and entries[0].get("id"):
+            return "https://www.youtube.com/watch?v=" + entries[0]["id"]
+
+    except Exception as error:
+        print("FIRST VIDEO URL ERROR:", error)
+
+    return None
+
+
+def youtube_step(t):
+    import urllib.parse
+
+    m = re.match(
+        r"^(?:search|find|look up|play|watch)\s+(?:for\s+)?(.+?)"
+        r"\s+(?:on|in)\s+youtube" + YT_FIRST + "$",
+        t,
+    ) or re.match(
+        r"^(?:search|look up)\s+youtube\s+(?:for\s+)?(.+?)" + YT_FIRST + "$",
+        t,
+    )
+
+    if m:
+        query = m.group(1).strip()
+        click_first = bool(
+            re.search(r"\b(?:first|top|1st)\b", t[m.end(1):])
+        )
+
+        if click_first:
+            video_url = first_video_url(query)
+
+            if video_url:
+                webbrowser.open(video_url)
+                return "Playing the first video for " + query + "."
+
+        webbrowser.open(
+            "https://www.youtube.com/results?search_query="
+            + urllib.parse.quote_plus(query)
+        )
+
+        if not click_first:
+            return "Opening YouTube search for " + query + "."
+
+        time.sleep(4)
+
+        return click_first_video_wait()
+
+    if t in ("debug links", "debug link"):
+        return debug_links()
+
+    if re.match(
+        r"^(?:click|play|open|select)(?:\s+on)?(?:\s+the)?\s+"
+        r"(?:first|top|1st)\s+(?:video|result|one)$",
+        t,
+    ):
+        return click_first_video_wait()
+
+    return None
+
+
 def run_step(text):
 
     orig = (
@@ -2402,6 +2737,12 @@ def run_step(text):
     ):
 
         return "I won't access protected areas."
+
+    # YouTube search / click first video
+    yt_reply = youtube_step(t)
+
+    if yt_reply is not None:
+        return yt_reply
 
     # -----------------------------------------------------
     # TYPE
@@ -3100,6 +3441,14 @@ HELP_TEXT = (
     "What's on my screen. Explain this error. "
     "Solve what I copied, or say solve what I copied in Notepad. "
     "Start dictation. "
+    "Weather in Bhopal. Air quality in Bhopal. "
+    "Can I go outside in Bhopal. Latest news. "
+    "Wikipedia, then a topic. "
+    "Are you online. "
+    "Teach me a skill: learn study mode, search lo-fi music on YouTube, "
+    "click first video. "
+    "Then just say study mode. List my skills. "
+    "You can also say longer things, like open YouTube and play lo-fi music. "
     "Remind me in ten minutes. Read my clipboard. "
     "Stop listening."
 )
@@ -3664,6 +4013,1029 @@ def rps_command(t):
 #   ("ask_ai", prompt, tokens)-> send prompt to LM Studio
 # ---------------------------------------------------------
 
+# =========================================================
+# ONLINE FEATURES + NEBIUS (NVIDIA Nemotron) HYBRID BRAIN
+#
+# Everything here is OPTIONAL. If there is no internet, SINK
+# keeps working with LM Studio + local Whisper like before.
+# Settings live in a .env file next to gui.py (see .env.example).
+# =========================================================
+
+import socket
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+
+def _load_env():
+    path = os.path.join(BASE_DIR, ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(
+                    key.strip(),
+                    value.strip().strip('"').strip("'"),
+                )
+    except FileNotFoundError:
+        pass
+    except Exception as error:
+        print("ENV ERROR:", error)
+
+
+_load_env()
+
+NEBIUS_API_KEY = os.environ.get("NEBIUS_API_KEY", "")
+NEBIUS_BASE_URL = os.environ.get("NEBIUS_BASE_URL", "")
+NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL", "")
+# Optional: a small fast model for chat/planning and a big one for
+# hard reasoning (solve). Both fall back to NEBIUS_MODEL.
+NEBIUS_MODEL_FAST = os.environ.get("NEBIUS_MODEL_FAST", "") or NEBIUS_MODEL
+NEBIUS_MODEL_HEAVY = (
+    os.environ.get("NEBIUS_MODEL_HEAVY", "")
+    or NEBIUS_MODEL
+    or NEBIUS_MODEL_FAST
+)
+USE_NEBIUS = os.environ.get("USE_NEBIUS", "1") != "0"
+DEFAULT_CITY = os.environ.get("SINK_DEFAULT_CITY", "")
+
+OFFLINE_MSG = (
+    "I'm offline right now, so I can't check that. "
+    "Everything else still works."
+)
+
+_NET = {"t": 0.0, "ok": False}
+_CLOUD = {"client": None}
+
+
+def internet_ok():
+    # Cached for 20 seconds so voice commands stay fast.
+    now = time.time()
+
+    if now - _NET["t"] < 20:
+        return _NET["ok"]
+
+    try:
+        socket.create_connection(("1.1.1.1", 53), timeout=1.5).close()
+        ok = True
+    except OSError:
+        ok = False
+
+    _NET["t"] = now
+    _NET["ok"] = ok
+
+    return ok
+
+
+def cloud_ready():
+    return bool(
+        USE_NEBIUS
+        and PROVIDERS
+        and internet_ok()
+    )
+
+
+def cloud_client():
+    if _CLOUD["client"] is None:
+        _CLOUD["client"] = OpenAI(
+            base_url=NEBIUS_BASE_URL,
+            api_key=NEBIUS_API_KEY,
+            max_retries=0,
+            timeout=25,
+        )
+
+    return _CLOUD["client"]
+
+
+# =========================================================
+# ONLINE BRAINS: Groq + Gemini (+ Nebius if still configured)
+#
+# Everyday chat / planning : Groq first (fast), then Gemini.
+# Hard "solve" questions   : Gemini first (smarter), then Groq.
+# If one fails or hits its free limit it is skipped for a minute,
+# the next one is tried, and finally the local LM Studio model.
+#
+# .env lines (all optional; set USE_NEBIUS=0 to turn online off):
+#   GROQ_API_KEY=...
+#   GROQ_MODEL=...            (GROQ_MODEL_HEAVY optional)
+#   GEMINI_API_KEY=...
+#   GEMINI_MODEL=...          (GEMINI_MODEL_HEAVY optional)
+# =========================================================
+
+PROVIDER_COOLDOWN = 60  # seconds to skip a provider after a failure
+_PROV_DOWN = {}
+PROVIDERS = []
+
+
+def _add_provider(name, key, url, fast, heavy="", extra_tokens=0):
+
+    if key and url and fast:
+
+        PROVIDERS.append({
+            "name": name,
+            "key": key,
+            "url": url,
+            "fast": fast,
+            "heavy": heavy or fast,
+            "extra_tokens": extra_tokens,
+            "client": None,
+        })
+
+
+_add_provider(
+    "groq",
+    os.environ.get("GROQ_API_KEY", ""),
+    "https://api.groq.com/openai/v1",
+    os.environ.get("GROQ_MODEL", ""),
+    os.environ.get("GROQ_MODEL_HEAVY", ""),
+)
+
+# Gemini "thinking" models spend part of max_tokens on hidden
+# thinking, so they get extra headroom to still return an answer.
+_add_provider(
+    "gemini",
+    os.environ.get("GEMINI_API_KEY", ""),
+    "https://generativelanguage.googleapis.com/v1beta/openai/",
+    os.environ.get("GEMINI_MODEL", ""),
+    os.environ.get("GEMINI_MODEL_HEAVY", ""),
+    extra_tokens=600,
+)
+
+# Old Nebius settings keep working if they are still in .env.
+_add_provider(
+    "nebius",
+    NEBIUS_API_KEY,
+    NEBIUS_BASE_URL,
+    NEBIUS_MODEL_FAST,
+    NEBIUS_MODEL_HEAVY,
+)
+
+
+def online_brain_name():
+
+    names = {
+        "groq": "Groq",
+        "gemini": "Gemini",
+        "nebius": "Nebius",
+    }
+
+    return " and ".join(
+        names[p["name"]] for p in PROVIDERS
+    )
+
+
+def cloud_chat(messages, max_tokens, temperature, heavy=False):
+
+    """Try the online brains in order. Returns the first good
+    result, or None so the caller can use the local model."""
+
+    order = (
+        ("gemini", "groq", "nebius")
+        if heavy
+        else ("groq", "gemini", "nebius")
+    )
+
+    for name in order:
+
+        for p in PROVIDERS:
+
+            if p["name"] != name:
+                continue
+
+            if time.time() < _PROV_DOWN.get(name, 0):
+                continue
+
+            model = p["heavy"] if heavy else p["fast"]
+
+            try:
+
+                if p["client"] is None:
+                    p["client"] = OpenAI(
+                        base_url=p["url"],
+                        api_key=p["key"],
+                        max_retries=0,
+                        timeout=25,
+                    )
+
+                result = p["client"].chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens + p["extra_tokens"],
+                    temperature=temperature,
+                )
+
+                content = result.choices[0].message.content
+
+                if content and content.strip():
+                    print("AI BACKEND:", name, "/", model)
+                    return result
+
+                print(name.upper() + ": empty answer, trying next.")
+
+            except Exception as error:
+
+                print(name.upper() + " FAILED:", error)
+
+                _PROV_DOWN[name] = time.time() + PROVIDER_COOLDOWN
+
+    return None
+
+
+def _http_get(url, params=None, timeout=6):
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "SINK-voice-assistant/1.0"},
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read()
+
+
+_WMO = {
+    0: "clear sky",
+    1: "mostly clear",
+    2: "partly cloudy",
+    3: "overcast",
+    45: "foggy",
+    48: "foggy",
+    51: "light drizzle",
+    53: "drizzle",
+    55: "heavy drizzle",
+    56: "freezing drizzle",
+    57: "freezing drizzle",
+    61: "light rain",
+    63: "rain",
+    65: "heavy rain",
+    66: "freezing rain",
+    67: "freezing rain",
+    71: "light snow",
+    73: "snow",
+    75: "heavy snow",
+    77: "snow grains",
+    80: "rain showers",
+    81: "rain showers",
+    82: "heavy rain showers",
+    85: "snow showers",
+    86: "snow showers",
+    95: "thunderstorms",
+    96: "thunderstorms with hail",
+    99: "thunderstorms with hail",
+}
+
+
+def get_weather(city):
+    # Only the city name leaves the PC. No voice, no chat.
+    if not internet_ok():
+        return OFFLINE_MSG
+
+    try:
+        geo = json.loads(
+            _http_get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                {"name": city, "count": 1},
+            )
+        )
+
+        place = geo["results"][0]
+
+        data = json.loads(
+            _http_get(
+                "https://api.open-meteo.com/v1/forecast",
+                {
+                    "latitude": place["latitude"],
+                    "longitude": place["longitude"],
+                    "current_weather": "true",
+                },
+            )
+        )["current_weather"]
+
+        sky = _WMO.get(int(data.get("weathercode", -1)), "")
+        temp = round(float(data["temperature"]))
+        wind = round(float(data["windspeed"]))
+
+        text = f"In {place['name']} it is {temp} degrees Celsius"
+
+        if sky:
+            text += f", {sky}"
+
+        text += f". Wind is {wind} kilometres per hour."
+
+        return text
+
+    except IndexError:
+        return f"I couldn't find a place called {city}."
+    except Exception as error:
+        print("WEATHER ERROR:", error)
+        return "I couldn't get the weather right now."
+
+
+def _geocode(city):
+    geo = json.loads(
+        _http_get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            {"name": city, "count": 1},
+        )
+    )
+
+    return geo["results"][0]
+
+
+def _aqi_level(aqi):
+    # US AQI scale
+    if aqi <= 50:
+        return "good"
+    if aqi <= 100:
+        return "moderate"
+    if aqi <= 150:
+        return "unhealthy for sensitive people"
+    if aqi <= 200:
+        return "unhealthy"
+    if aqi <= 300:
+        return "very unhealthy"
+    return "hazardous"
+
+
+def _get_air(place):
+    data = json.loads(
+        _http_get(
+            "https://air-quality-api.open-meteo.com/v1/air-quality",
+            {
+                "latitude": place["latitude"],
+                "longitude": place["longitude"],
+                "current": "us_aqi,pm2_5",
+            },
+        )
+    )["current"]
+
+    aqi = data.get("us_aqi")
+
+    return None if aqi is None else round(float(aqi))
+
+
+def get_air_quality(city):
+    if not internet_ok():
+        return OFFLINE_MSG
+
+    try:
+        place = _geocode(city)
+        aqi = _get_air(place)
+
+        if aqi is None:
+            return f"I couldn't get air quality data for {place['name']}."
+
+        return (
+            f"Air quality in {place['name']} is {_aqi_level(aqi)}. "
+            f"The AQI is {aqi} on the US scale."
+        )
+
+    except IndexError:
+        return f"I couldn't find a place called {city}."
+    except Exception as error:
+        print("AQI ERROR:", error)
+        return "I couldn't get the air quality right now."
+
+
+def go_out_advice(city):
+    # Weather + air quality -> a simple "is it okay to go out" answer.
+    if not internet_ok():
+        return OFFLINE_MSG
+
+    try:
+        place = _geocode(city)
+
+        w = json.loads(
+            _http_get(
+                "https://api.open-meteo.com/v1/forecast",
+                {
+                    "latitude": place["latitude"],
+                    "longitude": place["longitude"],
+                    "current_weather": "true",
+                },
+            )
+        )["current_weather"]
+
+        try:
+            aqi = _get_air(place)
+        except Exception as error:
+            print("AQI ERROR:", error)
+            aqi = None
+
+        code = int(w.get("weathercode", -1))
+        temp = round(float(w["temperature"]))
+        wind = round(float(w["windspeed"]))
+        sky = _WMO.get(code, "")
+
+        problems = []
+        tips = []
+
+        if code >= 95:
+            problems.append("there is a thunderstorm")
+        elif 51 <= code <= 67 or 80 <= code <= 82:
+            tips.append("it is raining, so take an umbrella")
+        elif 71 <= code <= 77 or 85 <= code <= 86:
+            tips.append("it is snowing, so dress warmly")
+
+        if temp >= 40:
+            problems.append("it is extremely hot")
+        elif temp >= 35:
+            tips.append("it is hot, so drink water and avoid the sun")
+        elif temp <= 5:
+            tips.append("it is cold, so wear warm clothes")
+
+        if wind >= 50:
+            problems.append("the wind is very strong")
+
+        if aqi is not None:
+            if aqi > 150:
+                problems.append(
+                    f"the air is {_aqi_level(aqi)} with an AQI of {aqi}"
+                )
+            elif aqi > 100:
+                tips.append(
+                    "the air is unhealthy for sensitive people, "
+                    "so a mask can help"
+                )
+
+        summary = f"In {place['name']} it is {temp} degrees Celsius"
+
+        if sky:
+            summary += f", {sky}"
+
+        summary += "."
+
+        if aqi is not None:
+            summary += f" AQI is {aqi}, {_aqi_level(aqi)}."
+
+        if problems:
+            verdict = (
+                " It is better to stay inside right now, because "
+                + " and ".join(problems)
+                + "."
+            )
+        else:
+            verdict = " It looks fine to go out."
+
+            if tips:
+                verdict += " Just note that " + " and ".join(tips) + "."
+
+        return summary + verdict
+
+    except IndexError:
+        return f"I couldn't find a place called {city}."
+    except Exception as error:
+        print("GO OUT ERROR:", error)
+        return "I couldn't check that right now."
+
+
+def get_news(count=4):
+    if not internet_ok():
+        return OFFLINE_MSG
+
+    try:
+        xml_data = _http_get(
+            "https://news.google.com/rss",
+            {"hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
+        )
+
+        root = ET.fromstring(xml_data)
+        titles = []
+
+        for item in root.iter("item"):
+            title = (item.findtext("title") or "").strip()
+
+            # Google News adds " - Source name" at the end.
+            title = re.sub(r"\s+-\s+[^-]+$", "", title)
+
+            if title:
+                titles.append(title)
+
+            if len(titles) >= count:
+                break
+
+        if not titles:
+            return "I couldn't find any news right now."
+
+        return "Top headlines. " + " ... ".join(
+            f"{i}. {t}" for i, t in enumerate(titles, 1)
+        )
+
+    except Exception as error:
+        print("NEWS ERROR:", error)
+        return "I couldn't get the news right now."
+
+
+def get_wiki(topic):
+    if not internet_ok():
+        return OFFLINE_MSG
+
+    try:
+        title = urllib.parse.quote(topic.strip().replace(" ", "_"))
+
+        data = json.loads(
+            _http_get(
+                "https://en.wikipedia.org/api/rest_v1/page/summary/"
+                + title
+            )
+        )
+
+        extract = (data.get("extract") or "").strip()
+
+        if not extract:
+            return f"I couldn't find {topic} on Wikipedia."
+
+        # Keep it short for voice: first two sentences.
+        sentences = re.split(r"(?<=[.!?])\s+", extract)
+
+        return " ".join(sentences[:2])
+
+    except Exception as error:
+        print("WIKI ERROR:", error)
+        return f"I couldn't find {topic} on Wikipedia."
+
+
+ACTION_HINT = re.compile(
+    r"\b(open|launch|go to|search|play|watch|listen|find|look up|"
+    r"type|write|click|press|scroll|close|switch|visit|"
+    r"minimi[sz]e|maximi[sz]e)\b",
+    re.I,
+)
+
+ALLOWED_STEP = re.compile(
+    r"^(open|go to|search|type|click|double click|right click|"
+    r"press|scroll|move mouse)\b",
+    re.I,
+)
+
+DANGEROUS_KEYS = re.compile(
+    r"alt\s*\+?\s*f4|win(?:dows)?\s*\+?\s*r\b|"
+    r"ctrl\s*\+?\s*alt\s*\+?\s*del",
+    re.I,
+)
+
+PLAN_PROMPT = (
+    "You turn a spoken request into simple desktop commands for a "
+    "voice assistant. Use ONLY these command forms: "
+    "open <app or website>; go to <website>; search <text>; "
+    "search <text> on youtube; click first video; "
+    "type <text>; click; click <button name>; double click; "
+    "right click; press <key>; scroll up; scroll down; "
+    "move mouse <left|right|up|down> <pixels>. "
+    "Reply with ONLY JSON like {\"steps\": "
+    "[\"search lo-fi music on youtube\", \"click first video\"]}. "
+    "Use at most 6 steps, in order. "
+    "If the request is a question or normal chat and not a computer "
+    "action, reply {\"steps\": []}. Never include shutdown, restart, "
+    "delete, passwords, tokens or system files."
+)
+
+
+def plan_steps(text):
+    # Nemotron (fast model) breaks a free-form request into steps
+    # that SINK's own run_step() already knows how to do.
+    try:
+        result = cloud_chat(
+            [
+                {"role": "system", "content": PLAN_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            400,
+            0.1,
+        )
+
+        if result is None:
+            return []
+
+        raw = result.choices[0].message.content or ""
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S | re.I)
+
+        found = re.search(r"\{.*\}", raw, re.S)
+
+        if not found:
+            return []
+
+        data = json.loads(found.group(0))
+
+        steps = [
+            str(s).strip()
+            for s in data.get("steps", [])
+            if str(s).strip()
+        ]
+
+        return steps[:6]
+
+    except Exception as error:
+        print("PLAN ERROR:", error)
+        return []
+
+
+# =========================================================
+# TEACHABLE SKILLS
+# Say: "learn study mode: open YouTube, search lo-fi music"
+# Later say: "study mode"  -> SINK runs all the steps.
+# Skills live in sink_skills.json (plain, local, editable).
+# =========================================================
+
+SKILL_FILE = os.path.join(BASE_DIR, "sink_skills.json")
+MAX_SKILLS = 30
+MAX_SKILL_STEPS = 8
+
+SKILL_STEP_OK = re.compile(
+    r"^(open|go to|search|google|type|write|click|double click|"
+    r"right click|left click|tap|hit|press|scroll|move mouse|copy|"
+    r"paste|cut|select all|close|switch|go back|go forward|new tab|"
+    r"next tab|refresh|reload|zoom|maximi[sz]e|minimi[sz]e|undo|"
+    r"redo|enter)\b",
+    re.I,
+)
+
+RESERVED_SKILL_NAMES = {
+    "stop", "help", "sleep", "go to sleep", "stop listening",
+    "dictation", "memory", "skills", "yes", "no",
+}
+
+
+def skills_load():
+    data = _json_load(SKILL_FILE)
+
+    return [
+        s for s in data
+        if isinstance(s, dict)
+        and s.get("name")
+        and isinstance(s.get("steps"), list)
+    ]
+
+
+def skills_save(skills):
+    _json_save(SKILL_FILE, skills)
+
+
+def _skill_name(name):
+    name = re.sub(r"[^a-z0-9 ]", " ", name.lower())
+
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def find_skill(name, skills):
+    name = _skill_name(name)
+
+    if not name:
+        return None
+
+    for s in skills:
+        if s["name"] == name:
+            return s
+
+    close = difflib.get_close_matches(
+        name,
+        [s["name"] for s in skills],
+        n=1,
+        cutoff=0.85,
+    )
+
+    if close:
+        for s in skills:
+            if s["name"] == close[0]:
+                return s
+
+    return None
+
+
+def split_skill_steps(text):
+    steps = []
+
+    for part in re.split(r"\s*,\s*", text.strip(" .!?")):
+        for s in STEP_SPLIT.split(part.strip()):
+            s = s.strip(" .!?,")
+
+            if s:
+                steps.append(s.lower())
+
+    return steps
+
+
+def check_skill_steps(steps):
+    # Returns (steps, None) if OK, else (None, error message).
+    if not steps:
+        return None, "I didn't hear any steps."
+
+    if len(steps) > MAX_SKILL_STEPS:
+        return None, (
+            f"A skill can have at most {MAX_SKILL_STEPS} steps."
+        )
+
+    for step in steps:
+
+        if is_blocked_request(step) or DANGEROUS_KEYS.search(step):
+            return None, (
+                "I won't save that, it touches protected areas."
+            )
+
+        if not SKILL_STEP_OK.match(step):
+            return None, (
+                f"I can't save the step {step}. A step should start "
+                "with open, search, type, click, press or scroll."
+            )
+
+    return steps, None
+
+
+def run_skill(skill, focus_cb=None):
+    steps = skill["steps"]
+
+    if focus_cb and needs_focus(" and ".join(steps)):
+        focus_cb()
+
+    failed = []
+
+    for i, step in enumerate(steps):
+
+        # Check again at run time: the file can be edited by hand.
+        if is_blocked_request(step) or DANGEROUS_KEYS.search(step):
+            failed.append(step)
+            continue
+
+        reply = run_step(step)
+
+        if reply is None:
+            failed.append(step)
+            continue
+
+        if reply.startswith("Opening") and i < len(steps) - 1:
+            time.sleep(2.5)
+
+    msg = f"{skill['name']} done."
+
+    if failed:
+        msg += " I couldn't do: " + ", ".join(failed) + "."
+
+    return msg
+
+
+def _teach_skill(name, steps_text, explicit):
+    name = _skill_name(name)
+
+    steps, error = check_skill_steps(split_skill_steps(steps_text))
+
+    if error:
+        # "learn python, how do I start" is probably just chat, so stay
+        # quiet for that case. Safety and size problems are always said.
+        chatty = error.startswith(("I can't save the step", "I didn't hear"))
+
+        return None if (chatty and not explicit) else error
+
+    if (
+        not name
+        or len(name.split()) > 5
+        or name in RESERVED_SKILL_NAMES
+        or SKILL_STEP_OK.match(name)
+    ):
+        return (
+            "Please pick a name that is not a command, "
+            "like study mode."
+        ) if explicit else None
+
+    skills = skills_load()
+    existing = find_skill(name, skills)
+
+    if existing:
+        existing["steps"] = steps
+        verb = "updated"
+    else:
+        if len(skills) >= MAX_SKILLS:
+            return "I have too many skills. Forget one first."
+
+        skills.append({"name": name, "steps": steps})
+        verb = "learned"
+
+    skills_save(skills)
+
+    return (
+        f"Okay, I {verb} {name}: "
+        + ", then ".join(steps)
+        + f". Say {name} to run it."
+    )
+
+
+def skill_command(t, focus_cb=None):
+    # Returns a spoken reply, or None if t is not about skills.
+
+    # LIST
+    if re.match(
+        r"^(?:(?:what|which) skills (?:do you have|have you learned|"
+        r"did you learn)|(?:list|show|read) (?:my |all |the )?skills|"
+        r"what are my skills|my skills)$",
+        t,
+    ):
+        skills = skills_load()
+
+        if not skills:
+            return (
+                "I haven't learned any skills yet. Say learn, then a "
+                "name, then the steps. For example: learn study mode, "
+                "search lo-fi music on YouTube, click first video."
+            )
+
+        return "My skills are: " + ", ".join(s["name"] for s in skills) + "."
+
+    # FORGET
+    m = re.match(
+        r"^(?:forget|delete|remove) (?:the |my )?(?:skill|routine) "
+        r"(?:called |named )?(.+)$",
+        t,
+    )
+
+    if m:
+        skills = skills_load()
+        skill = find_skill(m.group(1), skills)
+
+        if not skill:
+            return "I don't have a skill with that name."
+
+        skills.remove(skill)
+        skills_save(skills)
+
+        return f"Okay, I forgot {skill['name']}."
+
+    # ADD STEPS TO AN EXISTING SKILL
+    m = re.match(
+        r"^add (?:a )?(?:steps? )?to (?:the |my |skill )?(.+?)\s*[:,]\s*(.+)$",
+        t,
+    )
+
+    if m:
+        skills = skills_load()
+        skill = find_skill(m.group(1), skills)
+
+        if not skill:
+            return "I don't have a skill with that name."
+
+        new_steps, error = check_skill_steps(split_skill_steps(m.group(2)))
+
+        if error:
+            return error
+
+        if len(skill["steps"]) + len(new_steps) > MAX_SKILL_STEPS:
+            return (
+                f"A skill can have at most {MAX_SKILL_STEPS} steps."
+            )
+
+        skill["steps"].extend(new_steps)
+        skills_save(skills)
+
+        return f"Okay, I added that to {skill['name']}."
+
+    # TEACH: "when I say X, do Y"
+    m = re.match(
+        r"^when i say (.+?),? (?:then )?(?:please )?(?:do|run) (.+)$",
+        t,
+    )
+
+    if m:
+        return _teach_skill(m.group(1), m.group(2), True)
+
+    # TEACH: "learn X: steps" / "create a skill X: steps"
+    m = re.match(
+        r"^(?:(learn|teach)|(?:create|add|save|make) (?:a |new )*"
+        r"(?:skill|routine))\s+(?:a |new )*(?:skill |routine )?"
+        r"(?:called |named )?(.+?)\s*(?::|,|\bthat does\b|\bwhich does\b)\s*(.+)$",
+        t,
+    )
+
+    if m:
+        # Plain "learn ..." is only a skill if the steps are valid.
+        return _teach_skill(m.group(2), m.group(3), m.group(1) is None)
+
+    # RUN
+    skills = skills_load()
+
+    if skills:
+        m = re.match(
+            r"^(?:(?:run|start|do|activate|launch|play|begin)\s+)?"
+            r"(?:my\s+|the\s+)?(?:skill\s+|routine\s+)?(.+?)"
+            r"(?:\s+(?:skill|routine))?$",
+            t,
+        )
+
+        if m:
+            skill = find_skill(m.group(1), skills)
+
+            if skill:
+                return run_skill(skill, focus_cb)
+
+    return None
+
+
+def online_command(t):
+    # Returns a spoken reply, or None if t is not an online command.
+
+    # WHICH BRAIN
+    if re.match(
+        r"^(?:are you|am i|are we) (?:online|offline|connected)|"
+        r"^(?:which|what) (?:model|brain|ai) (?:are you using|do you use|is this)$",
+        t,
+    ):
+        if cloud_ready():
+            return (
+                "I'm online. I'm using "
+                + online_brain_name()
+                + ". If the internet drops, I switch to my local model."
+            )
+
+        if internet_ok():
+            return (
+                "I'm online, but the cloud model is not set up, "
+                "so I'm using my local model."
+            )
+
+        return "I'm offline. I'm running fully on my local model."
+
+    # AIR QUALITY
+    m = re.match(
+        r"^(?:what(?:'s|s| is)?|how(?:'s|s| is)?|tell me|check)?\s*"
+        r"(?:the\s+)?(?:air quality|aqi|pollution)\s*(?:like\s+)?"
+        r"(?:(?:in|of|at|for|near)\s+(.+?))?"
+        r"(?:\s+(?:today|now|right now))?$",
+        t,
+    )
+
+    if m:
+        city = (m.group(1) or "").strip() or DEFAULT_CITY
+
+        if not city:
+            return "Which city? Say air quality in, then the city name."
+
+        return get_air_quality(city)
+
+    # CAN I GO OUT?
+    m = re.match(
+        r"^(?:(?:can|should|may) i (?:go|step|walk) (?:out|outside)|"
+        r"is it (?:ok|okay|safe|fine|good|alright)"
+        r"(?: for me)? to (?:go|step) (?:out|outside)|"
+        r"is it (?:ok|okay|safe|fine|good|alright) outside)"
+        r"(?:\s+(?:in|at)\s+(.+?))?"
+        r"(?:\s+(?:today|now|right now))?$",
+        t,
+    )
+
+    if m:
+        city = (m.group(1) or "").strip() or DEFAULT_CITY
+
+        if not city:
+            return "Which city? Say can I go outside in, then the city name."
+
+        return go_out_advice(city)
+
+    # WEATHER
+    m = re.match(
+        r"^(?:what(?:'s|s| is)?|how(?:'s|s| is)?|tell me|give me|"
+        r"show me|check)?\s*(?:the\s+)?(?:current\s+)?"
+        r"(?:weather|temperature)\s*(?:like\s+)?"
+        r"(?:(?:in|of|at|for|near)\s+(.+?))?"
+        r"(?:\s+(?:today|now|right now))?$",
+        t,
+    )
+
+    if m:
+        city = (m.group(1) or "").strip() or DEFAULT_CITY
+
+        if not city:
+            return (
+                "Which city? Say weather in, then the city name."
+            )
+
+        return get_weather(city)
+
+    # NEWS
+    if re.match(
+        r"^(?:(?:what(?:'s|s| is)?|tell me|read|give me|show me)\s+)?"
+        r"(?:the\s+)?(?:latest\s+|top\s+|today's\s+|todays\s+)?"
+        r"(?:news|headlines)(?:\s+(?:today|now))?$",
+        t,
+    ):
+        return get_news()
+
+    # WIKIPEDIA
+    m = re.match(
+        r"^(?:search\s+)?wikipedia\s+(?:for\s+|about\s+)?(.+)$|"
+        r"^(?:search\s+|look up\s+|tell me about\s+)?(.+?)\s+on wikipedia$",
+        t,
+    )
+
+    if m:
+        topic = (m.group(1) or m.group(2) or "").strip()
+
+        if topic:
+            return get_wiki(topic)
+
+    return None
+
+
 def extra_command(text, focus_cb=None):
 
     orig = text.strip()
@@ -3720,6 +5092,24 @@ def extra_command(text, focus_cb=None):
             "Dictation on. Click where you want to type "
             "and start speaking. Say stop typing to finish.",
         )
+
+    # ----------------------------------------------------
+    # ONLINE: weather, news, wikipedia, which brain
+    # ----------------------------------------------------
+
+    online_reply = online_command(t)
+
+    if online_reply is not None:
+        return ("say", online_reply)
+
+    # ----------------------------------------------------
+    # TEACHABLE SKILLS
+    # ----------------------------------------------------
+
+    skill_reply = skill_command(t, focus_cb)
+
+    if skill_reply is not None:
+        return ("say", skill_reply)
 
     # ----------------------------------------------------
     # ROCK PAPER SCISSORS
@@ -4114,7 +5504,11 @@ class Worker(QThread):
 
         # Set by extra commands that want the AI to answer
         self.ai_text = None
-        self.ai_tokens = 80
+        self.ai_tokens = (
+            220
+            if persona_load()["mode"] == "friend"
+            else 80
+        )
 
         # Screen vision / solve-to-Notepad state
         self.screen_b64 = None
@@ -4199,6 +5593,16 @@ class Worker(QThread):
 
         if not t:
             return None
+
+        # ---------------------------------------------
+        # MAM / SIR  +  FRIEND / ASSISTANT MODE
+        # ---------------------------------------------
+
+        persona_reply = persona_command(t)
+
+        if persona_reply is not None:
+
+            return persona_reply
 
         # ---------------------------------------------
         # CHIBI PERSONALITY
@@ -4317,7 +5721,64 @@ class Worker(QThread):
 
             time.sleep(0.7)
 
-        return run_command(text)
+        reply = run_command(text)
+
+        # SINK did not understand it -> let Nemotron plan the steps.
+        if reply is None:
+            reply = self.agent_command(text)
+
+        return reply
+
+    # -----------------------------------------------------
+
+    def agent_command(self, text):
+
+        # Online only. Offline, SINK behaves exactly as before.
+        if not cloud_ready():
+            return None
+
+        if not ACTION_HINT.search(text):
+            return None
+
+        steps = plan_steps(text)
+
+        print("AGENT PLAN:", steps)
+
+        # Safety: every step must be a known, safe command.
+        for step in steps:
+
+            if is_blocked_request(step) or DANGEROUS_KEYS.search(step):
+
+                return "I won't do that, it touches protected areas."
+
+        steps = [s for s in steps if ALLOWED_STEP.match(s)]
+
+        if not steps:
+            return None
+
+        if needs_focus(" and ".join(steps)):
+            self._focus()
+
+        done = []
+
+        for i, step in enumerate(steps):
+
+            reply = run_step(step)
+
+            print("AGENT STEP:", step, "->", reply)
+
+            if reply is None:
+                continue
+
+            done.append(step)
+
+            if reply.startswith("Opening") and i < len(steps) - 1:
+                time.sleep(2.5)
+
+        if not done:
+            return None
+
+        return "Okay. I did: " + ", then ".join(done) + "."
 
     # -----------------------------------------------------
 
@@ -4356,6 +5817,62 @@ class Worker(QThread):
             pyautogui.hotkey("ctrl", "v")
         else:
             pyautogui.write(full, interval=0.005)
+
+    # -----------------------------------------------------
+
+    def _complete(self, messages, temperature):
+
+        # 1) Online brains (Groq / Gemini), only when online.
+        #    Screenshots always stay local (they need a vision model).
+        if not self.screen_b64 and cloud_ready():
+
+            # Routing: heavy (Gemini first) for solve,
+            # fast (Groq first) for everything else.
+            result = cloud_chat(
+                messages,
+                self.ai_tokens,
+                temperature,
+                heavy=bool(self.solve_mode),
+            )
+
+            if result is not None:
+                return result
+
+            print("ONLINE: no brain answered, using local model.")
+            _NET["t"] = 0.0
+
+        # 2) Local brain: LM Studio (works with no internet).
+        if self.model_id is None:
+
+            try:
+
+                self.model_id = (
+                    self.client
+                    .with_options(
+                        timeout=3,
+                        max_retries=0,
+                    )
+                    .models
+                    .list()
+                    .data[0]
+                    .id
+                )
+
+            except Exception:
+
+                raise RuntimeError(
+                    "No AI is available. The internet or cloud model "
+                    "is off and the LM Studio server is not running."
+                )
+
+        print("AI BACKEND: LM Studio (local)")
+
+        return self.client.chat.completions.create(
+            model=self.model_id,
+            messages=messages,
+            max_tokens=self.ai_tokens,
+            temperature=temperature,
+        )
 
     # -----------------------------------------------------
 
@@ -4457,6 +5974,10 @@ class Worker(QThread):
                     "\n\nKnown facts about the user:"
                 )[0]
 
+                # Mam / Sir + assistant / friend mode
+                base = base.split("\n\nSINK persona:")[0]
+                base += "\n\n" + persona_text()
+
                 facts = mem_load()
 
                 if facts:
@@ -4479,38 +6000,7 @@ class Worker(QThread):
                     "content": text,
                 })
 
-            # -----------------------------------------
-            # FIND MODEL
-            # -----------------------------------------
-
-            if self.model_id is None:
-
-                try:
-
-                    self.model_id = (
-                        self.client
-                        .with_options(
-                            timeout=3,
-                            max_retries=0,
-                        )
-                        .models
-                        .list()
-                        .data[0]
-                        .id
-                    )
-
-                except Exception:
-
-                    error_text = (
-                        "SINK ERROR\n\n"
-                        "LM Studio server is not running."
-                    )
-
-                    self.reply.emit(
-                        error_text
-                    )
-
-                    return
+            # (model lookup now happens inside _complete)
 
             # -----------------------------------------
             # AI REQUEST
@@ -4571,14 +6061,9 @@ class Worker(QThread):
                     },
                 ]
 
-            result = (
-                self.client
-                .chat.completions.create(
-                    model=self.model_id,
-                    messages=messages,
-                    max_tokens=self.ai_tokens,
-                    temperature=temperature,
-                )
+            result = self._complete(
+                messages,
+                temperature,
             )
 
             answer = (
@@ -4698,11 +6183,25 @@ class ListenLoop(QThread):
 
     def transcribe(self, audio):
 
+        # Make quiet speech louder before recognition
+        peak = (
+            float(np.max(np.abs(audio)))
+            if len(audio)
+            else 0.0
+        )
+
+        if peak > 0.01:
+            audio = (
+                audio * (0.9 / peak)
+            ).astype(np.float32)
+
         segments, _ = stt.transcribe(
             audio,
             language="en",
             initial_prompt=INITIAL_PROMPT,
             beam_size=1,
+            vad_filter=True,
+            condition_on_previous_text=False,
         )
 
         text = " ".join(
@@ -4725,6 +6224,20 @@ class ListenLoop(QThread):
         )
 
         if not m:
+
+            # "go to sleep SINK" (wake word at the end)
+            if re.match(
+                r"^(?:go to sleep|sleep|good night)[,.! ]*"
+                r"(?:sink|sync|think|zinc|zink|sing|sank)\W*$",
+                text,
+                re.I,
+            ):
+
+                self.command.emit(
+                    "go to sleep"
+                )
+
+                return
 
             # While a game or dictation is running,
             # no wake word is needed.
@@ -4812,10 +6325,10 @@ class ListenLoop(QThread):
                     )
 
                 threshold = max(
-                    0.012,
+                    0.008,
                     float(
                         np.mean(noise)
-                    ) * 3,
+                    ) * 2.5,
                 )
 
                 print(
@@ -4999,6 +6512,24 @@ class SinkWindow(QWidget):
 
         self.quiet_timer.timeout.connect(
             self.on_quiet
+        )
+
+        # Auto-sleep: no command for AUTO_SLEEP_MIN minutes
+        # -> stop the mic listener + hide chibi (saves battery).
+        self.sleep_timer = QTimer(
+            self
+        )
+
+        self.sleep_timer.setSingleShot(
+            True
+        )
+
+        self.sleep_timer.setInterval(
+            AUTO_SLEEP_MIN * 60 * 1000
+        )
+
+        self.sleep_timer.timeout.connect(
+            self.auto_sleep
         )
 
         # ---------------------------------------------
@@ -5364,6 +6895,99 @@ class SinkWindow(QWidget):
         self.setLayout(
             layout
         )
+
+    # =====================================================
+    # SHORTCUT KEY  /  WAKE  /  SLEEP
+    # =====================================================
+
+    def is_awake(self):
+
+        return (
+            self.isVisible()
+            or (
+                self.chibi is not None
+                and self.chibi.isVisible()
+            )
+        )
+
+    def wake_sink(self):
+
+        ensure_lm_studio()
+
+        self.create_chibi()
+
+        self.chibi.wake_up()
+
+        if (
+            self.listener is None
+            or not self.listener.running
+        ):
+
+            self.toggle_handsfree()
+
+        self.sleep_timer.start()
+
+    def sleep_sink(self):
+
+        self.sleep_timer.stop()
+
+        if (
+            self.listener is not None
+            and self.listener.running
+        ):
+
+            self.toggle_handsfree()
+
+        if self.chibi is not None:
+
+            self.chibi.hide()
+
+        self.hide()
+
+    def hotkey_toggle(self):
+
+        if self.is_awake():
+
+            self.sleep_sink()
+
+        else:
+
+            self.wake_sink()
+
+    def auto_sleep(self):
+
+        busy = (
+            self.worker is not None
+            and self.worker.isRunning()
+        )
+
+        # Do not sleep while a command runs, a game or
+        # dictation is active, or the dashboard is open.
+        if busy or self.isVisible() or session_active():
+
+            self.sleep_timer.start()
+
+            return
+
+        self.sleep_sink()
+
+    def show_dashboard(self):
+
+        self.restore_from_chibi()
+
+        self.sleep_timer.start()
+
+    def quit_sink(self):
+
+        if self.listener is not None:
+
+            self.listener.running = False
+
+            self.listener.wait(
+                1500
+            )
+
+        QApplication.quit()
 
     # =====================================================
     # CREATE CHIBI
@@ -5812,6 +7436,9 @@ class SinkWindow(QWidget):
         # ONLY "SINK"
         # ---------------------------------------------
 
+        # Any heard command keeps SINK awake.
+        self.sleep_timer.start()
+
         if cmd == "__WAKE_ONLY__":
 
             # FIX:
@@ -5875,6 +7502,24 @@ class SinkWindow(QWidget):
 
             self.show_blush()
             self.start_worker(cmd)
+            return
+
+        # GO TO SLEEP: turn SINK fully off (mic + chibi)
+        # ---------------------------------------------
+
+        if low in (
+            "go to sleep",
+            "sleep",
+            "sleep now",
+            "good night",
+        ):
+
+            speak_async(
+                "Going to sleep. Call me when you need me."
+            )
+
+            self.sleep_sink()
+
             return
 
         # NORMAL WAKE ANIMATION
@@ -6175,6 +7820,138 @@ class SinkWindow(QWidget):
 
         event.accept()
 
+        # SINK can now sleep with no window visible, so closing
+        # the dashboard quits explicitly (same behaviour as before).
+        QApplication.quit()
+
+
+# =========================================================
+# SHORTCUT SERVER + TRAY
+# =========================================================
+
+LM_STUDIO_PORT = 1234
+
+
+def ensure_lm_studio():
+
+    """Start LM Studio's local server if it is not running.
+    Runs in a background thread, so SINK never waits for it."""
+
+    def _run():
+
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", LM_STUDIO_PORT),
+                timeout=0.5,
+            ):
+                print("LM STUDIO: already running")
+                return
+        except OSError:
+            pass
+
+        try:
+            subprocess.Popen(
+                ["lms", "server", "start"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    0x08000000 if os.name == "nt" else 0
+                ),
+            )
+            print("LM STUDIO: start requested")
+
+        except FileNotFoundError:
+            print(
+                "LM STUDIO: the 'lms' command was not found. "
+                "Start the LM Studio server by hand."
+            )
+
+        except Exception as error:
+            print("LM STUDIO START ERROR:", error)
+
+    threading.Thread(
+        target=_run,
+        daemon=True,
+    ).start()
+
+
+class ShortcutBridge(QObject):
+
+    toggle = Signal()
+    dashboard = Signal()
+
+
+def start_shortcut_server(bridge):
+
+    """Blocks on accept(), so it uses no CPU while waiting."""
+
+    if _SINK_SERVER is None:
+        print("SHORTCUT TOGGLE UNAVAILABLE: port busy.")
+        return
+
+    def serve():
+
+        while True:
+
+            try:
+                conn, _ = _SINK_SERVER.accept()
+            except OSError:
+                return
+
+            with conn:
+
+                try:
+                    msg = conn.recv(16)
+                except OSError:
+                    continue
+
+                if msg.startswith(b"dashboard"):
+                    bridge.dashboard.emit()
+                elif msg.startswith(b"toggle"):
+                    bridge.toggle.emit()
+
+    threading.Thread(
+        target=serve,
+        daemon=True,
+    ).start()
+
+
+def build_tray(app, window):
+
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#FFC93C"))
+    p.drawEllipse(6, 6, 52, 52)
+    p.end()
+
+    tray = QSystemTrayIcon(QIcon(pm), app)
+    menu = QMenu()
+
+    def add(label, fn):
+        act = QAction(label, menu)
+        act.triggered.connect(fn)
+        menu.addAction(act)
+
+    add("Wake / Sleep SINK", window.hotkey_toggle)
+    add("Open dashboard", window.show_dashboard)
+    menu.addSeparator()
+    add("Friend mode", lambda: persona_set("mode", "friend"))
+    add("Assistant mode", lambda: persona_set("mode", "assistant"))
+    add("Call me Mam", lambda: persona_set("address", "Mam"))
+    add("Call me Sir", lambda: persona_set("address", "Sir"))
+    menu.addSeparator()
+    add("Quit SINK", window.quit_sink)
+
+    tray.setContextMenu(menu)
+    tray.setToolTip("SINK")
+    tray.show()
+
+    return tray
+
 
 # =========================================================
 # START SINK
@@ -6186,15 +7963,48 @@ if __name__ == "__main__":
         sys.argv
     )
 
+    # SINK can sleep with every window hidden; it must not quit then.
+    app.setQuitOnLastWindowClosed(
+        False
+    )
+
+    # Gaming laptop: never compete with games or the browser.
+    try:
+        psutil.Process().nice(
+            psutil.BELOW_NORMAL_PRIORITY_CLASS
+        )
+    except Exception:
+        pass
+
+    ensure_lm_studio()
+
     window = SinkWindow()
 
-    window.show()
+    bridge = ShortcutBridge()
+    bridge.toggle.connect(window.hotkey_toggle)
+    bridge.dashboard.connect(window.show_dashboard)
+    start_shortcut_server(bridge)
+
+    tray = build_tray(app, window)
+
+    if "--dashboard" in sys.argv:
+
+        # Old behaviour: open the full dashboard.
+        window.show()
+
+    else:
+
+        # Launched with the shortcut key: chibi only.
+        window.create_chibi()
+        window.chibi.wake_up()
 
     # Start listening on launch: no mouse needed.
     QTimer.singleShot(
         1500,
         window.toggle_handsfree,
     )
+
+    window.sleep_timer.start()
 
     sys.exit(
         app.exec()
