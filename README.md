@@ -130,6 +130,60 @@ It is a plain text file in the same folder as `gui.py`. You can open or delete i
 - Moving the mouse to a screen corner stops `pyautogui` immediately (the failsafe is on).
 
 ---
+## 🎮 Cool SINK Commands
+
+### YouTube Control
+- `SINK, open YouTube`
+- `SINK, search YouTube for Python tutorials`
+- `SINK, play the first video`
+- `SINK, pause the video`
+- `SINK, resume the video`
+- `SINK, search YouTube for Minecraft gameplay`
+- `SINK, open the first search result`
+
+### PC Control
+- `SINK, open Chrome`
+- `SINK, open Notepad`
+- `SINK, take a screenshot`
+- `SINK, move the mouse right 200`
+- `SINK, scroll down`
+- `SINK, press enter`
+- `SINK, open a new tab`
+- `SINK, close the current window`
+- `SINK, volume up`
+- `SINK, mute the volume`
+
+### AI and Study
+- `SINK, what is artificial intelligence?`
+- `SINK, explain Python list comprehension`
+- `SINK, quiz me on binary trees`
+- `SINK, explain what I copied`
+- `SINK, summarize my clipboard`
+- `SINK, translate what I copied to Hindi`
+- `SINK, search for Python tutorials`
+
+### Tasks and Productivity
+- `SINK, add task finish my assignment`
+- `SINK, read my tasks`
+- `SINK, complete task 2`
+- `SINK, remind me in 10 minutes to drink water`
+- `SINK, set a timer for 5 minutes`
+- `SINK, start typing`
+- `SINK, stop typing`
+
+### System Information
+- `SINK, check my CPU usage`
+- `SINK, check my RAM usage`
+- `SINK, check my battery`
+- `SINK, check my disk usage`
+- `SINK, what time is it?`
+
+### Fun Commands
+- `SINK, I love you`
+- `SINK, you are so cute`
+- `SINK, dance for me`
+
+--- 
 
 ## Troubleshooting
 
